@@ -5,8 +5,8 @@ const DEFAULT_MONGODB_URI_TEMPLATE =
   'mongodb+srv://<db_username>:<db_password>@rakesh.f82ecsa.mongodb.net/?retryWrites=true&w=majority&appName=Rakesh';
 
 const buildMongoUri = () => {
-  const username = process.env.DB_USER;
-  const password = process.env.DB_PASS;
+  const username = process.env.DB_USER || 'devrakeshkrishnan';
+  const password = process.env.DB_PASS || 'ZEGFug9p98MBSSF3';
   const template = process.env.MONGODB_URI_TEMPLATE || DEFAULT_MONGODB_URI_TEMPLATE;
 
   if (!username) {
