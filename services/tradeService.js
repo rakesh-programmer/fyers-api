@@ -1,6 +1,7 @@
 const { fyersModel, fyersDataSocket } = require('fyers-api-v3');
 const crypto = require('crypto');
 const fs = require('fs');
+const { logTradeExecuted, logTradeExited } = require('./tradeLogService');
 
 const APP_ID = process.env.FYERS_APP_ID;
 const CHECK_INTERVAL_MS = 10000;
@@ -10,7 +11,6 @@ const fyers = new fyersModel();
 
 // --- Shared DataSocket (one per process) ---
 let dataSocket = null;
-// Map of symbol -> array of price listener callbacks
 const priceListeners = new Map();
 
 const getOrCreateDataSocket = () => {
@@ -40,9 +40,7 @@ const getOrCreateDataSocket = () => {
     const tickData = message?.data?.[0];
     if (!tickData) return;
     const listeners = priceListeners.get(tickData.symbol);
-    if (listeners) {
-      listeners.forEach((cb) => cb(tickData.ltp));
-    }
+    if (listeners) listeners.forEach((cb) => cb(tickData.ltp));
   });
 
   dataSocket.on('error', (err) => console.error('[DataSocket] Error:', err));
@@ -54,14 +52,17 @@ const getOrCreateDataSocket = () => {
 // -----------------------------------------------------------------------
 // executeTrade — place an order and track until P&L target is hit
 //
-// side   : 1 = BUY (long),  -1 = SELL (short)
-// targetPct / stopLossPct : percentages (e.g. 0.6 = 0.6%)
-//
-// For a BUY  : profit when price rises (+targetPct), loss when falls (-slPct)
-// For a SELL : profit when price falls (-targetPct), loss when rises (+slPct)
-//   exit side is the opposite of entry side
+// side : 1 = BUY (long),  -1 = SELL (short)
+// meta : { chartink_name, scan_name, triggered_at }  — for logging only
 // -----------------------------------------------------------------------
-const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6, side = 1) => {
+const executeTrade = async (
+  symbol,
+  quantity,
+  targetPct = 0.6,
+  stopLossPct = 0.6,
+  side = 1,
+  meta = {}
+) => {
   const currentAccessToken = process.env.FYERS_ACCESS_TOKEN;
   if (!APP_ID || !currentAccessToken) {
     throw new Error('Missing Access Token. Visit /login to authenticate first.');
@@ -79,7 +80,7 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     offlineOrder: false,
     productType: 'INTRADAY',
     qty: quantity,
-    side,                 // 1 = BUY, -1 = SELL
+    side,
     stopLoss: 0,
     stopPrice: 0,
     symbol,
@@ -94,6 +95,17 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     return { success: false, symbol, details: orderResponse };
   }
 
+  // --- Log: TRADE_EXECUTED ---
+  await logTradeExecuted({
+    chartink_name: meta.chartink_name || '',
+    fyers_name: symbol,
+    direction,
+    quantity,
+    scan_name: meta.scan_name || '',
+    triggered_at: meta.triggered_at || '',
+    orderResponse
+  });
+
   // Log files
   const randomHash = crypto.randomBytes(4).toString('hex');
   const orderLogFile = `order_response_${symbol.replace(/:/g, '_')}_${randomHash}.log`;
@@ -107,24 +119,19 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
   let isActive = true;
   let intervalId = null;
 
-  // Register price listener for this symbol
-  if (!priceListeners.has(symbol)) {
-    priceListeners.set(symbol, []);
-  }
+  if (!priceListeners.has(symbol)) priceListeners.set(symbol, []);
   const onPrice = (ltp) => { latestPrice = ltp; };
   priceListeners.get(symbol).push(onPrice);
 
-  // Subscribe via shared socket
   const socket = getOrCreateDataSocket();
   socket.subscribe([symbol]);
   socket.mode(socket.LiteMode);
 
-  const stopTracking = async (reason) => {
+  const stopTracking = async (reason, pctChange) => {
     if (!isActive) return;
     isActive = false;
     clearInterval(intervalId);
 
-    // Remove this listener
     const listeners = priceListeners.get(symbol) || [];
     const idx = listeners.indexOf(onPrice);
     if (idx !== -1) listeners.splice(idx, 1);
@@ -133,14 +140,15 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
       socket.unsubscribe([symbol]);
     }
 
-    const exitSide = side === 1 ? -1 : 1;   // BUY trade exits via SELL, SELL trade exits via BUY
+    const exitSide = side === 1 ? -1 : 1;
     const exitDirection = exitSide === 1 ? 'BUY' : 'SELL';
     const exitLog = `[${symbol}] Exiting (${reason}). Placing ${exitDirection} order...`;
     console.log(exitLog);
     fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - ${exitLog}\n`);
 
+    let exitResponse = null;
     try {
-      const exitResponse = await fyers.place_order({
+      exitResponse = await fyers.place_order({
         disclosedQty: 0,
         limitPrice: 0,
         offlineOrder: false,
@@ -162,6 +170,19 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     } catch (err) {
       console.error(`[${symbol}] Failed to exit position:`, err);
     }
+
+    // --- Log: TRADE_EXITED ---
+    await logTradeExited({
+      chartink_name: meta.chartink_name || '',
+      fyers_name: symbol,
+      direction,
+      quantity,
+      entryPrice,
+      exitPrice: latestPrice,
+      pnl_pct: pctChange,
+      reason,
+      exitResponse
+    });
   };
 
   intervalId = setInterval(async () => {
@@ -172,20 +193,18 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
       return;
     }
 
-    // Fetch entry price from positions if not yet set
     if (entryPrice === 0) {
       try {
         const posResponse = await fyers.get_positions();
         if (posResponse?.netPositions) {
           const position = posResponse.netPositions.find((p) => p.symbol === symbol);
           if (position) {
-            // buyAvg for long positions, sellAvg for short positions
             const avgPrice = side === 1 ? position.buyAvg : position.sellAvg;
             if (avgPrice > 0) {
               entryPrice = avgPrice;
               console.log(`[${symbol}] Entry price locked at Rs${entryPrice} (${direction})`);
             } else {
-              console.log(`[${symbol}] Waiting for position to appear in book...`);
+              console.log(`[${symbol}] Waiting for position avg price...`);
               return;
             }
           } else {
@@ -200,8 +219,6 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     }
 
     const priceDiff = latestPrice - entryPrice;
-    // For BUY  : positive priceDiff = profit
-    // For SELL : negative priceDiff = profit → invert percentage for sell
     const pctChange = (priceDiff / entryPrice) * 100 * side;
 
     const logLine = `[${symbol}] LTP: Rs${latestPrice} | Entry: Rs${entryPrice} | P&L: ${pctChange.toFixed(3)}% (${direction})`;
@@ -209,9 +226,9 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - ${logLine}\n`);
 
     if (pctChange >= targetPct) {
-      await stopTracking(`Profit target hit (${pctChange.toFixed(3)}% >= +${targetPct}%)`);
+      await stopTracking(`Profit target hit (${pctChange.toFixed(3)}% >= +${targetPct}%)`, pctChange);
     } else if (pctChange <= -stopLossPct) {
-      await stopTracking(`Stop loss hit (${pctChange.toFixed(3)}% <= -${stopLossPct}%)`);
+      await stopTracking(`Stop loss hit (${pctChange.toFixed(3)}% <= -${stopLossPct}%)`, pctChange);
     }
   }, CHECK_INTERVAL_MS);
 
@@ -226,10 +243,7 @@ const LEGACY_QTY = 1;
 
 const enterTradeService = async () => {
   console.log('enterTrade called (legacy)');
-  return executeTrade(LEGACY_SYMBOL, LEGACY_QTY, 0.1, 0.1, 1);
+  return executeTrade(LEGACY_SYMBOL, LEGACY_QTY, 0.1, 0.1, 1, {});
 };
 
-module.exports = {
-  enterTradeService,
-  executeTrade
-};
+module.exports = { enterTradeService, executeTrade };
