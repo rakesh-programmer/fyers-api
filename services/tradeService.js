@@ -10,7 +10,7 @@ const fyers = new fyersModel();
 
 // --- Shared DataSocket (one per process) ---
 let dataSocket = null;
-// Map of symbol -> array of listener callbacks (for price updates)
+// Map of symbol -> array of price listener callbacks
 const priceListeners = new Map();
 
 const getOrCreateDataSocket = () => {
@@ -29,7 +29,6 @@ const getOrCreateDataSocket = () => {
 
   dataSocket.on('connect', () => {
     console.log('[DataSocket] Connected.');
-    // Re-subscribe all active symbols
     const symbols = [...priceListeners.keys()];
     if (symbols.length > 0) {
       dataSocket.subscribe(symbols);
@@ -53,10 +52,16 @@ const getOrCreateDataSocket = () => {
 };
 
 // -----------------------------------------------------------------------
-// executeTrade — place a BUY order and track until P&L target is hit
-// targetPct and stopLossPct are percentages, e.g. 0.6 means 0.6%
+// executeTrade — place an order and track until P&L target is hit
+//
+// side   : 1 = BUY (long),  -1 = SELL (short)
+// targetPct / stopLossPct : percentages (e.g. 0.6 = 0.6%)
+//
+// For a BUY  : profit when price rises (+targetPct), loss when falls (-slPct)
+// For a SELL : profit when price falls (-targetPct), loss when rises (+slPct)
+//   exit side is the opposite of entry side
 // -----------------------------------------------------------------------
-const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6) => {
+const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6, side = 1) => {
   const currentAccessToken = process.env.FYERS_ACCESS_TOKEN;
   if (!APP_ID || !currentAccessToken) {
     throw new Error('Missing Access Token. Visit /login to authenticate first.');
@@ -65,7 +70,8 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
   fyers.setAppId(APP_ID);
   fyers.setAccessToken(currentAccessToken);
 
-  console.log(`[${symbol}] Placing BUY order — qty: ${quantity}`);
+  const direction = side === 1 ? 'BUY' : 'SELL';
+  console.log(`[${symbol}] Placing ${direction} order — qty: ${quantity}`);
 
   const orderResponse = await fyers.place_order({
     disclosedQty: 0,
@@ -73,7 +79,7 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     offlineOrder: false,
     productType: 'INTRADAY',
     qty: quantity,
-    side: 1,
+    side,                 // 1 = BUY, -1 = SELL
     stopLoss: 0,
     stopPrice: 0,
     symbol,
@@ -93,7 +99,7 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
   const orderLogFile = `order_response_${symbol.replace(/:/g, '_')}_${randomHash}.log`;
   const trackingLogFile = `trade_tracker_${symbol.replace(/:/g, '_')}_${randomHash}.log`;
   fs.writeFileSync(orderLogFile, JSON.stringify(orderResponse, null, 2));
-  fs.writeFileSync(trackingLogFile, `--- Trade Tracking Started for ${symbol} ---\n`);
+  fs.writeFileSync(trackingLogFile, `--- ${direction} Trade Tracking Started for ${symbol} ---\n`);
 
   // Per-trade state
   let entryPrice = 0;
@@ -127,7 +133,9 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
       socket.unsubscribe([symbol]);
     }
 
-    const exitLog = `[${symbol}] Exiting: ${reason}. Placing SELL order...`;
+    const exitSide = side === 1 ? -1 : 1;   // BUY trade exits via SELL, SELL trade exits via BUY
+    const exitDirection = exitSide === 1 ? 'BUY' : 'SELL';
+    const exitLog = `[${symbol}] Exiting (${reason}). Placing ${exitDirection} order...`;
     console.log(exitLog);
     fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - ${exitLog}\n`);
 
@@ -138,7 +146,7 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
         offlineOrder: false,
         productType: 'INTRADAY',
         qty: quantity,
-        side: -1,
+        side: exitSide,
         stopLoss: 0,
         stopPrice: 0,
         symbol,
@@ -147,7 +155,10 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
         validity: 'DAY'
       });
       console.log(`[${symbol}] Position closed:`, exitResponse);
-      fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - Exit response: ${JSON.stringify(exitResponse)}\n`);
+      fs.appendFileSync(
+        trackingLogFile,
+        `${new Date().toISOString()} - Exit response: ${JSON.stringify(exitResponse)}\n`
+      );
     } catch (err) {
       console.error(`[${symbol}] Failed to exit position:`, err);
     }
@@ -167,11 +178,18 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
         const posResponse = await fyers.get_positions();
         if (posResponse?.netPositions) {
           const position = posResponse.netPositions.find((p) => p.symbol === symbol);
-          if (position && position.buyAvg > 0) {
-            entryPrice = position.buyAvg;
-            console.log(`[${symbol}] Entry price locked at Rs${entryPrice}`);
+          if (position) {
+            // buyAvg for long positions, sellAvg for short positions
+            const avgPrice = side === 1 ? position.buyAvg : position.sellAvg;
+            if (avgPrice > 0) {
+              entryPrice = avgPrice;
+              console.log(`[${symbol}] Entry price locked at Rs${entryPrice} (${direction})`);
+            } else {
+              console.log(`[${symbol}] Waiting for position to appear in book...`);
+              return;
+            }
           } else {
-            console.log(`[${symbol}] Waiting for position to appear in book...`);
+            console.log(`[${symbol}] Position not found yet. Waiting...`);
             return;
           }
         }
@@ -182,8 +200,11 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     }
 
     const priceDiff = latestPrice - entryPrice;
-    const pctChange = (priceDiff / entryPrice) * 100;
-    const logLine = `[${symbol}] LTP: Rs${latestPrice} | AvgBuy: Rs${entryPrice} | P&L: ${pctChange.toFixed(3)}%`;
+    // For BUY  : positive priceDiff = profit
+    // For SELL : negative priceDiff = profit → invert percentage for sell
+    const pctChange = (priceDiff / entryPrice) * 100 * side;
+
+    const logLine = `[${symbol}] LTP: Rs${latestPrice} | Entry: Rs${entryPrice} | P&L: ${pctChange.toFixed(3)}% (${direction})`;
     console.log(logLine);
     fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - ${logLine}\n`);
 
@@ -194,18 +215,18 @@ const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6
     }
   }, CHECK_INTERVAL_MS);
 
-  return { success: true, symbol, data: orderResponse };
+  return { success: true, symbol, direction, data: orderResponse };
 };
 
 // -----------------------------------------------------------------------
-// Backward-compatible wrapper used by the existing /api/trade/enter route
+// Backward-compatible wrapper for the existing /api/trade/enter route
 // -----------------------------------------------------------------------
 const LEGACY_SYMBOL = 'NSE:WIPRO-EQ';
 const LEGACY_QTY = 1;
 
 const enterTradeService = async () => {
   console.log('enterTrade called (legacy)');
-  return executeTrade(LEGACY_SYMBOL, LEGACY_QTY, 0.1, 0.1);
+  return executeTrade(LEGACY_SYMBOL, LEGACY_QTY, 0.1, 0.1, 1);
 };
 
 module.exports = {

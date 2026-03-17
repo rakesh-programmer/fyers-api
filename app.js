@@ -5,6 +5,7 @@ const githubRoutes = require('./routes/githubRoutes');
 const tradeRoutes = require('./routes/tradeRoutes');
 const watchlistRoutes = require('./routes/watchlistRoutes');
 const chartinkWebhookRoutes = require('./routes/chartinkWebhookRoutes');
+const chartinkSellWebhookRoutes = require('./routes/chartinkSellWebhookRoutes');
 
 const app = express();
 
@@ -14,5 +15,6 @@ app.use(authRoutes);
 app.use('/api/trade', tradeRoutes);
 app.use('/api/watchlist', watchlistRoutes);
 app.use('/api/webhook', chartinkWebhookRoutes);
+app.use('/api/webhook', chartinkSellWebhookRoutes);
 
 module.exports = app;
