@@ -3,208 +3,212 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 const APP_ID = process.env.FYERS_APP_ID;
-
-const SYMBOL = 'NSE:WIPRO-EQ';
-const QUANTITY = 1;
-const TARGET_PROFIT_PERCENTAGE = 0.1;
-const STOP_LOSS_PERCENTAGE = 0.1;
 const CHECK_INTERVAL_MS = 10000;
 
-let isTradeActive = false;
-let entryPrice = 0;
-let latestPrice = 0;
-let priceTrackerInterval = null;
-let currentTrackingLogFile = null;
-
+// --- Singleton Fyers HTTP client ---
 const fyers = new fyersModel();
 
-let dataSocket = {
-  LiteMode: 'LiteMode',
-  connect: () => {},
-  mode: () => {},
-  on: () => {},
-  subscribe: () => {},
-  unsubscribe: () => {}
-};
+// --- Shared DataSocket (one per process) ---
+let dataSocket = null;
+// Map of symbol -> array of listener callbacks (for price updates)
+const priceListeners = new Map();
 
-const applySocketListeners = () => {
-  dataSocket.on('connect', () => {
-    console.log(`WebSocket Connected. Subscribing to ${SYMBOL}...`);
-    dataSocket.subscribe([SYMBOL]);
-    dataSocket.mode(dataSocket.LiteMode);
-  });
+const getOrCreateDataSocket = () => {
+  if (dataSocket) return dataSocket;
 
-  dataSocket.on('message', async (message) => {
-    if (!isTradeActive) return;
-
-    const tickData = message?.data?.[0];
-    if (tickData && tickData.symbol === SYMBOL) {
-      latestPrice = tickData.ltp;
-    }
-  });
-
-  dataSocket.on('error', (err) => console.error('WebSocket Error:', err));
-};
-
-const setupFyersServices = () => {
   const currentAccessToken = process.env.FYERS_ACCESS_TOKEN;
-  const currentCombinedToken = `${APP_ID}:${currentAccessToken}`;
-
-  if (APP_ID && currentAccessToken) {
-    fyers.setAppId(APP_ID);
-    fyers.setAccessToken(currentAccessToken);
-
-    try {
-      dataSocket = fyersDataSocket.getInstance(currentCombinedToken, './logs', false);
-      applySocketListeners();
-    } catch (error) {
-      console.error('Failed to initialize Fyers DataSocket:', error.message);
-    }
-
-    return;
+  if (!APP_ID || !currentAccessToken) {
+    throw new Error('Missing Access Token. Visit /login to authenticate first.');
   }
 
-  console.warn('FYERS_ACCESS_TOKEN is missing. Please login first at /login');
-  throw new Error('Missing Access Token. Visit /login to authenticate first.');
+  fyers.setAppId(APP_ID);
+  fyers.setAccessToken(currentAccessToken);
+
+  const combinedToken = `${APP_ID}:${currentAccessToken}`;
+  dataSocket = fyersDataSocket.getInstance(combinedToken, './logs', false);
+
+  dataSocket.on('connect', () => {
+    console.log('[DataSocket] Connected.');
+    // Re-subscribe all active symbols
+    const symbols = [...priceListeners.keys()];
+    if (symbols.length > 0) {
+      dataSocket.subscribe(symbols);
+      dataSocket.mode(dataSocket.LiteMode);
+    }
+  });
+
+  dataSocket.on('message', (message) => {
+    const tickData = message?.data?.[0];
+    if (!tickData) return;
+    const listeners = priceListeners.get(tickData.symbol);
+    if (listeners) {
+      listeners.forEach((cb) => cb(tickData.ltp));
+    }
+  });
+
+  dataSocket.on('error', (err) => console.error('[DataSocket] Error:', err));
+
+  dataSocket.connect();
+  return dataSocket;
 };
 
-const startTrackingInterval = () => {
-  if (priceTrackerInterval) clearInterval(priceTrackerInterval);
+// -----------------------------------------------------------------------
+// executeTrade — place a BUY order and track until P&L target is hit
+// targetPct and stopLossPct are percentages, e.g. 0.6 means 0.6%
+// -----------------------------------------------------------------------
+const executeTrade = async (symbol, quantity, targetPct = 0.6, stopLossPct = 0.6) => {
+  const currentAccessToken = process.env.FYERS_ACCESS_TOKEN;
+  if (!APP_ID || !currentAccessToken) {
+    throw new Error('Missing Access Token. Visit /login to authenticate first.');
+  }
 
-  priceTrackerInterval = setInterval(async () => {
-    if (!isTradeActive) return;
+  fyers.setAppId(APP_ID);
+  fyers.setAccessToken(currentAccessToken);
+
+  console.log(`[${symbol}] Placing BUY order — qty: ${quantity}`);
+
+  const orderResponse = await fyers.place_order({
+    disclosedQty: 0,
+    limitPrice: 0,
+    offlineOrder: false,
+    productType: 'INTRADAY',
+    qty: quantity,
+    side: 1,
+    stopLoss: 0,
+    stopPrice: 0,
+    symbol,
+    takeProfit: 0,
+    type: 2,
+    validity: 'DAY'
+  });
+
+  console.log(`[${symbol}] Order response:`, orderResponse);
+
+  if (orderResponse?.s !== 'ok') {
+    return { success: false, symbol, details: orderResponse };
+  }
+
+  // Log files
+  const randomHash = crypto.randomBytes(4).toString('hex');
+  const orderLogFile = `order_response_${symbol.replace(/:/g, '_')}_${randomHash}.log`;
+  const trackingLogFile = `trade_tracker_${symbol.replace(/:/g, '_')}_${randomHash}.log`;
+  fs.writeFileSync(orderLogFile, JSON.stringify(orderResponse, null, 2));
+  fs.writeFileSync(trackingLogFile, `--- Trade Tracking Started for ${symbol} ---\n`);
+
+  // Per-trade state
+  let entryPrice = 0;
+  let latestPrice = 0;
+  let isActive = true;
+  let intervalId = null;
+
+  // Register price listener for this symbol
+  if (!priceListeners.has(symbol)) {
+    priceListeners.set(symbol, []);
+  }
+  const onPrice = (ltp) => { latestPrice = ltp; };
+  priceListeners.get(symbol).push(onPrice);
+
+  // Subscribe via shared socket
+  const socket = getOrCreateDataSocket();
+  socket.subscribe([symbol]);
+  socket.mode(socket.LiteMode);
+
+  const stopTracking = async (reason) => {
+    if (!isActive) return;
+    isActive = false;
+    clearInterval(intervalId);
+
+    // Remove this listener
+    const listeners = priceListeners.get(symbol) || [];
+    const idx = listeners.indexOf(onPrice);
+    if (idx !== -1) listeners.splice(idx, 1);
+    if (listeners.length === 0) {
+      priceListeners.delete(symbol);
+      socket.unsubscribe([symbol]);
+    }
+
+    const exitLog = `[${symbol}] Exiting: ${reason}. Placing SELL order...`;
+    console.log(exitLog);
+    fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - ${exitLog}\n`);
+
+    try {
+      const exitResponse = await fyers.place_order({
+        disclosedQty: 0,
+        limitPrice: 0,
+        offlineOrder: false,
+        productType: 'INTRADAY',
+        qty: quantity,
+        side: -1,
+        stopLoss: 0,
+        stopPrice: 0,
+        symbol,
+        takeProfit: 0,
+        type: 2,
+        validity: 'DAY'
+      });
+      console.log(`[${symbol}] Position closed:`, exitResponse);
+      fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - Exit response: ${JSON.stringify(exitResponse)}\n`);
+    } catch (err) {
+      console.error(`[${symbol}] Failed to exit position:`, err);
+    }
+  };
+
+  intervalId = setInterval(async () => {
+    if (!isActive) return;
 
     if (latestPrice === 0) {
-      console.log(`[${SYMBOL}] Waiting for active price stream... (LTP is 0)`);
+      console.log(`[${symbol}] Waiting for price stream... (LTP = 0)`);
       return;
     }
 
+    // Fetch entry price from positions if not yet set
     if (entryPrice === 0) {
       try {
         const posResponse = await fyers.get_positions();
-
-        if (posResponse && posResponse.netPositions) {
-          const position = posResponse.netPositions.find((item) => item.symbol === SYMBOL);
-
+        if (posResponse?.netPositions) {
+          const position = posResponse.netPositions.find((p) => p.symbol === symbol);
           if (position && position.buyAvg > 0) {
             entryPrice = position.buyAvg;
-            console.log(`[${SYMBOL}] Extracted true avg buy price: Rs${entryPrice} from positions`);
+            console.log(`[${symbol}] Entry price locked at Rs${entryPrice}`);
           } else {
-            console.log(`[${SYMBOL}] Position not found in order book yet. Waiting...`);
+            console.log(`[${symbol}] Waiting for position to appear in book...`);
             return;
           }
-        } else {
-          return;
         }
-      } catch (error) {
-        console.error('Failed to fetch positions for entry price:', error);
+      } catch (err) {
+        console.error(`[${symbol}] Error fetching positions:`, err);
         return;
       }
     }
 
-    const priceDifference = latestPrice - entryPrice;
-    const percentageChange = (priceDifference / entryPrice) * 100;
+    const priceDiff = latestPrice - entryPrice;
+    const pctChange = (priceDiff / entryPrice) * 100;
+    const logLine = `[${symbol}] LTP: Rs${latestPrice} | AvgBuy: Rs${entryPrice} | P&L: ${pctChange.toFixed(3)}%`;
+    console.log(logLine);
+    fs.appendFileSync(trackingLogFile, `${new Date().toISOString()} - ${logLine}\n`);
 
-    const logStatement = `[${SYMBOL}] LTP: Rs${latestPrice} | Avg Buy: Rs${entryPrice} | P&L: ${percentageChange.toFixed(3)}%`;
-    console.log(logStatement);
-
-    if (currentTrackingLogFile) {
-      fs.appendFileSync(currentTrackingLogFile, `${new Date().toISOString()} - ${logStatement}\n`);
-    }
-
-    if (
-      percentageChange >= TARGET_PROFIT_PERCENTAGE ||
-      percentageChange <= -STOP_LOSS_PERCENTAGE
-    ) {
-      const exitLog = `Target reached (${percentageChange.toFixed(3)}%). Triggering square-off...`;
-      console.log(exitLog);
-
-      if (currentTrackingLogFile) {
-        fs.appendFileSync(currentTrackingLogFile, `${new Date().toISOString()} - ${exitLog}\n`);
-      }
-
-      isTradeActive = false;
-      clearInterval(priceTrackerInterval);
-
-      try {
-        const exitResponse = await fyers.place_order({
-          disclosedQty: 0,
-          limitPrice: 0,
-          offlineOrder: false,
-          productType: 'INTRADAY',
-          qty: QUANTITY,
-          side: -1,
-          stopLoss: 0,
-          stopPrice: 0,
-          symbol: SYMBOL,
-          takeProfit: 0,
-          type: 2,
-          validity: 'DAY'
-        });
-
-        console.log('Position closed successfully:', exitResponse);
-
-        dataSocket.unsubscribe([SYMBOL]);
-        entryPrice = 0;
-        latestPrice = 0;
-      } catch (error) {
-        console.error('Failed to exit position:', error);
-        isTradeActive = true;
-        startTrackingInterval();
-      }
+    if (pctChange >= targetPct) {
+      await stopTracking(`Profit target hit (${pctChange.toFixed(3)}% >= +${targetPct}%)`);
+    } else if (pctChange <= -stopLossPct) {
+      await stopTracking(`Stop loss hit (${pctChange.toFixed(3)}% <= -${stopLossPct}%)`);
     }
   }, CHECK_INTERVAL_MS);
+
+  return { success: true, symbol, data: orderResponse };
 };
 
+// -----------------------------------------------------------------------
+// Backward-compatible wrapper used by the existing /api/trade/enter route
+// -----------------------------------------------------------------------
+const LEGACY_SYMBOL = 'NSE:WIPRO-EQ';
+const LEGACY_QTY = 1;
+
 const enterTradeService = async () => {
-  console.log('enterTrade called');
-  setupFyersServices();
-
-  if (isTradeActive) {
-    return { success: false, isAlreadyActive: true };
-  }
-
-  try {
-    const orderResponse = await fyers.place_order({
-      disclosedQty: 0,
-      limitPrice: 0,
-      offlineOrder: false,
-      productType: 'INTRADAY',
-      qty: QUANTITY,
-      side: 1,
-      stopLoss: 0,
-      stopPrice: 0,
-      symbol: SYMBOL,
-      takeProfit: 0,
-      type: 2,
-      validity: 'DAY'
-    });
-
-    console.log('Order placed successfully:', orderResponse);
-
-    if (orderResponse?.s === 'ok') {
-      isTradeActive = true;
-
-      const randomHash = crypto.randomBytes(4).toString('hex');
-      const orderResponseLogFile = `order_response_${randomHash}.log`;
-      fs.writeFileSync(orderResponseLogFile, JSON.stringify(orderResponse, null, 2));
-
-      currentTrackingLogFile = `trade_tracker_${randomHash}.log`;
-      fs.writeFileSync(currentTrackingLogFile, `--- Trade Tracking Started for ${SYMBOL} ---\n`);
-
-      dataSocket.connect();
-      startTrackingInterval();
-
-      return { success: true, data: orderResponse };
-    }
-
-    return { success: false, details: orderResponse };
-  } catch (error) {
-    console.error('Failed to place order:', error);
-    throw error;
-  }
+  console.log('enterTrade called (legacy)');
+  return executeTrade(LEGACY_SYMBOL, LEGACY_QTY, 0.1, 0.1);
 };
 
 module.exports = {
-  enterTradeService
+  enterTradeService,
+  executeTrade
 };
